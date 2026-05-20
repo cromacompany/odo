@@ -10,9 +10,11 @@ import android.graphics.Paint
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.location.Geocoder
+import android.location.Location
 import android.os.Build
 import android.os.Bundle
 import android.view.MotionEvent
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -21,6 +23,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,6 +43,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -56,11 +61,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -79,7 +88,11 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.math.roundToInt
 import android.graphics.Color as AndroidColor
 
 private val TitleColor = Color(0xFF18212C)
@@ -124,7 +137,10 @@ private fun OdoApp() {
     val isMonitoring = trackingSnapshot.isServiceAlive(nowMillis)
     var logSizeLabel by remember { mutableStateOf(logger.fileSizeLabel()) }
     var selectedTripId by rememberSaveable { mutableStateOf<String?>(null) }
+    var detailTripId by rememberSaveable { mutableStateOf<String?>(null) }
+    var isSettingsOpen by rememberSaveable { mutableStateOf(false) }
     val selectedTrip = trips.firstOrNull { it.id == selectedTripId } ?: trips.firstOrNull()
+    val detailTrip = trips.firstOrNull { it.id == detailTripId }
     val permissions = remember { requiredPermissions() }
     var hasPermissions by remember { mutableStateOf(context.hasRequiredPermissions(permissions)) }
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -153,7 +169,71 @@ private fun OdoApp() {
         }
     }
 
+    val onStartMonitoring = {
+        if (context.hasRequiredPermissions(permissions)) {
+            hasPermissions = true
+            logger.event("Avvio monitoraggio richiesto da UI")
+            context.startTrackingService()
+            trackingStateStore.setMonitoring(true)
+        } else {
+            logger.event("Richiesta permessi da UI")
+            permissionLauncher.launch(permissions)
+        }
+        logSizeLabel = logger.fileSizeLabel()
+    }
+    val onStopMonitoring = {
+        logger.event("Stop monitoraggio richiesto da UI")
+        context.stopTrackingService()
+        trackingStateStore.setMonitoring(false)
+        logSizeLabel = logger.fileSizeLabel()
+    }
+    val onShareLog = {
+        runCatching {
+            logger.event("Condivisione log richiesta da UI")
+            context.startActivity(Intent.createChooser(logger.shareIntent(), "Condividi log Odo"))
+        }.onFailure { throwable ->
+            logger.error("Errore condivisione log", throwable)
+        }
+        logSizeLabel = logger.fileSizeLabel()
+    }
+    val onClearLog = {
+        logger.clear()
+        logSizeLabel = logger.fileSizeLabel()
+    }
+
+    BackHandler(enabled = detailTrip != null || isSettingsOpen) {
+        if (detailTrip != null) {
+            detailTripId = null
+        } else {
+            isSettingsOpen = false
+        }
+    }
+
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+        if (detailTrip != null) {
+            RouteDetailScreen(
+                trip = detailTrip,
+                modifier = Modifier.padding(innerPadding),
+                onBack = { detailTripId = null },
+            )
+            return@Scaffold
+        }
+
+        if (isSettingsOpen) {
+            SettingsScreen(
+                hasPermissions = hasPermissions,
+                isMonitoring = isMonitoring,
+                logSizeLabel = logSizeLabel,
+                modifier = Modifier.padding(innerPadding),
+                onBack = { isSettingsOpen = false },
+                onStart = onStartMonitoring,
+                onStop = onStopMonitoring,
+                onShareLog = onShareLog,
+                onClearLog = onClearLog,
+            )
+            return@Scaffold
+        }
+
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -164,51 +244,22 @@ private fun OdoApp() {
         ) {
             item {
                 Spacer(modifier = Modifier.height(10.dp))
-                Header(
-                    hasPermissions = hasPermissions,
-                    isMonitoring = isMonitoring,
-                    onStart = {
-                        if (context.hasRequiredPermissions(permissions)) {
-                            hasPermissions = true
-                            logger.event("Avvio monitoraggio richiesto da UI")
-                            context.startTrackingService()
-                            trackingStateStore.setMonitoring(true)
-                        } else {
-                            logger.event("Richiesta permessi da UI")
-                            permissionLauncher.launch(permissions)
-                        }
-                        logSizeLabel = logger.fileSizeLabel()
-                    },
-                    onStop = {
-                        logger.event("Stop monitoraggio richiesto da UI")
-                        context.stopTrackingService()
-                        trackingStateStore.setMonitoring(false)
-                        logSizeLabel = logger.fileSizeLabel()
-                    },
-                )
+                HomeHeader(onOpenSettings = { isSettingsOpen = true })
+            }
+
+            if (!isMonitoring) {
+                item {
+                    ServiceClosedWarning()
+                }
             }
 
             item {
-                LogExportCard(
-                    fileSizeLabel = logSizeLabel,
-                    onShare = {
-                        runCatching {
-                            logger.event("Condivisione log richiesta da UI")
-                            context.startActivity(Intent.createChooser(logger.shareIntent(), "Condividi log Odo"))
-                        }.onFailure { throwable ->
-                            logger.error("Errore condivisione log", throwable)
-                        }
-                        logSizeLabel = logger.fileSizeLabel()
-                    },
-                    onClear = {
-                        logger.clear()
-                        logSizeLabel = logger.fileSizeLabel()
+                SelectedTripCard(
+                    trip = selectedTrip,
+                    onOpenMap = {
+                        if (selectedTrip != null) detailTripId = selectedTrip.id
                     },
                 )
-            }
-
-            item {
-                SelectedTripCard(trip = selectedTrip)
             }
 
             item {
@@ -234,6 +285,129 @@ private fun OdoApp() {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun HomeHeader(onOpenSettings: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "Odo",
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold,
+            color = TitleColor,
+        )
+        IconButton(onClick = onOpenSettings) {
+            SettingsGearIcon()
+        }
+    }
+}
+
+@Composable
+private fun ServiceClosedWarning() {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = Color(0xFFFFE9D6),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Text(
+            text = "Servizio spento: i viaggi non vengono registrati.",
+            modifier = Modifier.padding(12.dp),
+            color = Color(0xFF8A3D00),
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun SettingsScreen(
+    hasPermissions: Boolean,
+    isMonitoring: Boolean,
+    logSizeLabel: String,
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    onShareLog: () -> Unit,
+    onClearLog: () -> Unit,
+) {
+    LazyColumn(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFFF6F7F9))
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item {
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Settings",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = TitleColor,
+                )
+                IconButton(onClick = onBack) {
+                    BackArrowIcon()
+                }
+            }
+        }
+        item {
+            Header(
+                hasPermissions = hasPermissions,
+                isMonitoring = isMonitoring,
+                onStart = onStart,
+                onStop = onStop,
+            )
+        }
+        item {
+            LogExportCard(
+                fileSizeLabel = logSizeLabel,
+                onShare = onShareLog,
+                onClear = onClearLog,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsGearIcon() {
+    Canvas(modifier = Modifier.size(24.dp)) {
+        val color = TitleColor
+        val stroke = 2.1.dp.toPx()
+        val center = Offset(size.width / 2f, size.height / 2f)
+        val radius = 6.5.dp.toPx()
+        val toothStart = 8.8.dp.toPx()
+        val toothEnd = 11.2.dp.toPx()
+
+        drawCircle(color = color, radius = radius, center = center, style = Stroke(width = stroke))
+        drawCircle(color = color, radius = 2.4.dp.toPx(), center = center)
+        drawLine(color, Offset(center.x, center.y - toothStart), Offset(center.x, center.y - toothEnd), stroke)
+        drawLine(color, Offset(center.x, center.y + toothStart), Offset(center.x, center.y + toothEnd), stroke)
+        drawLine(color, Offset(center.x - toothStart, center.y), Offset(center.x - toothEnd, center.y), stroke)
+        drawLine(color, Offset(center.x + toothStart, center.y), Offset(center.x + toothEnd, center.y), stroke)
+        drawLine(color, Offset(center.x - 6.2.dp.toPx(), center.y - 6.2.dp.toPx()), Offset(center.x - 7.9.dp.toPx(), center.y - 7.9.dp.toPx()), stroke)
+        drawLine(color, Offset(center.x + 6.2.dp.toPx(), center.y - 6.2.dp.toPx()), Offset(center.x + 7.9.dp.toPx(), center.y - 7.9.dp.toPx()), stroke)
+        drawLine(color, Offset(center.x - 6.2.dp.toPx(), center.y + 6.2.dp.toPx()), Offset(center.x - 7.9.dp.toPx(), center.y + 7.9.dp.toPx()), stroke)
+        drawLine(color, Offset(center.x + 6.2.dp.toPx(), center.y + 6.2.dp.toPx()), Offset(center.x + 7.9.dp.toPx(), center.y + 7.9.dp.toPx()), stroke)
+    }
+}
+
+@Composable
+private fun BackArrowIcon() {
+    Canvas(modifier = Modifier.size(24.dp)) {
+        val color = TitleColor
+        val stroke = 2.4.dp.toPx()
+        val y = size.height / 2f
+        drawLine(color, Offset(7.dp.toPx(), y), Offset(20.dp.toPx(), y), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(7.dp.toPx(), y), Offset(13.dp.toPx(), 6.dp.toPx()), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(7.dp.toPx(), y), Offset(13.dp.toPx(), 18.dp.toPx()), stroke, cap = StrokeCap.Round)
     }
 }
 
@@ -334,9 +508,11 @@ private fun StatusPill(isMonitoring: Boolean) {
 }
 
 @Composable
-private fun SelectedTripCard(trip: Trip?) {
+private fun SelectedTripCard(trip: Trip?, onOpenMap: () -> Unit = {}) {
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = trip != null, onClick = onOpenMap),
         color = Color.White,
         shape = RoundedCornerShape(8.dp),
         tonalElevation = 1.dp,
@@ -354,19 +530,185 @@ private fun SelectedTripCard(trip: Trip?) {
 }
 
 @Composable
-private fun RouteMap(points: List<RoutePoint>) {
+private fun RouteDetailScreen(trip: Trip, modifier: Modifier = Modifier, onBack: () -> Unit) {
+    var selectedRoutePoint by remember(trip.id) { mutableStateOf(trip.routePointInfoAt(0)) }
+    val lastPointIndex = (trip.points.size - 1).coerceAtLeast(0)
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFFF6F7F9))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Percorso", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = TitleColor)
+                Text(
+                    text = "${formatDate(trip.startMillis)}, ${formatTime(trip.startMillis)} - ${formatTime(trip.endMillis)}, ${formatDuration(trip.durationMillis)}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = SecondaryTextColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            IconButton(onClick = onBack) {
+                BackArrowIcon()
+            }
+        }
+
+        selectedRoutePoint?.let { pointInfo ->
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = Color.White,
+                shape = RoundedCornerShape(8.dp),
+                tonalElevation = 1.dp,
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CompactRouteValue("Km", formatDistance(pointInfo.distanceMeters))
+                    CompactRouteValue("Ora", formatTime(pointInfo.timestampMillis))
+                    CompactRouteValue("Tempo", formatDuration(pointInfo.elapsedMillis))
+                }
+            }
+        }
+
+        RouteMap(
+            points = trip.points,
+            modifier = Modifier
+                .fillMaxWidth()
+            .weight(1f),
+            interactive = true,
+            selectedPoint = selectedRoutePoint?.point,
+            onRoutePointSelected = { selectedRoutePoint = trip.routePointInfoNear(it) },
+        )
+
+        selectedRoutePoint?.let { pointInfo ->
+            if (trip.points.size <= 1) return@let
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                RouteEndpointDot(color = Color(0xFF1F8A4C))
+                RouteProgressSlider(
+                    value = pointInfo.index,
+                    lastIndex = lastPointIndex,
+                    onValueChange = { index -> selectedRoutePoint = trip.routePointInfoAt(index) },
+                    modifier = Modifier.weight(1f),
+                )
+                RouteEndpointDot(color = Color(0xFFD62828))
+            }
+        }
+    }
+}
+
+@Composable
+private fun RouteProgressSlider(
+    value: Int,
+    lastIndex: Int,
+    onValueChange: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var widthPx by remember { mutableStateOf(1) }
+
+    fun indexAt(x: Float): Int {
+        if (lastIndex <= 0) return 0
+        val fraction = (x / widthPx).coerceIn(0f, 1f)
+        return (fraction * lastIndex).roundToInt().coerceIn(0, lastIndex)
+    }
+
+    Canvas(
+        modifier = modifier
+            .height(44.dp)
+            .onSizeChanged { widthPx = it.width.coerceAtLeast(1) }
+            .pointerInput(lastIndex) {
+                detectTapGestures { offset -> onValueChange(indexAt(offset.x)) }
+            }
+            .pointerInput(lastIndex) {
+                detectDragGestures { change, _ ->
+                    change.consume()
+                    onValueChange(indexAt(change.position.x))
+                }
+            },
+    ) {
+        val fraction = if (lastIndex > 0) value.toFloat() / lastIndex else 0f
+        val thumbCenterX = size.width * fraction.coerceIn(0f, 1f)
+        val y = size.height / 2f
+        val trackStroke = 14f
+        val thumbWidth = 7.dp.toPx()
+        val thumbHeight = 26.dp.toPx()
+        val thumbLeft = (thumbCenterX - thumbWidth / 2f).coerceIn(0f, size.width - thumbWidth)
+        val thumbTop = y - thumbHeight / 2f
+
+        drawLine(
+            color = Color(0xFFC8D1DA),
+            start = Offset(0f, y),
+            end = Offset(size.width, y),
+            strokeWidth = trackStroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = Color(0xFF146C94),
+            start = Offset(0f, y),
+            end = Offset(thumbCenterX, y),
+            strokeWidth = trackStroke,
+            cap = StrokeCap.Round,
+        )
+        drawRoundRect(
+            color = Color(0xFFF5B700),
+            topLeft = Offset(thumbLeft, thumbTop),
+            size = Size(thumbWidth, thumbHeight),
+            cornerRadius = CornerRadius(999f, 999f),
+        )
+    }
+}
+
+@Composable
+private fun RouteEndpointDot(color: Color) {
+    Box(
+        modifier = Modifier
+            .size(12.dp)
+            .background(color, RoundedCornerShape(999.dp)),
+    )
+}
+
+@Composable
+private fun CompactRouteValue(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, style = MaterialTheme.typography.labelSmall, color = SecondaryTextColor)
+        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = BodyColor)
+    }
+}
+
+@Composable
+private fun RouteMap(
+    points: List<RoutePoint>,
+    modifier: Modifier = Modifier
+        .fillMaxWidth()
+        .aspectRatio(1.7f),
+    interactive: Boolean = false,
+    selectedPoint: RoutePoint? = null,
+    onRoutePointSelected: ((GeoPoint) -> Unit)? = null,
+) {
     val context = LocalContext.current
     var isMapLoading by remember(points) { mutableStateOf(true) }
+    var fittedTripId by remember { mutableStateOf<Int?>(null) }
     val mapView = remember {
         Configuration.getInstance().userAgentValue = context.packageName
         MapView(context).apply {
             setTileSource(SimpleRoadMapTileSource)
-            setMultiTouchControls(false)
+            setMultiTouchControls(interactive)
             setBuiltInZoomControls(false)
-            isClickable = false
-            isFocusable = false
-            isFocusableInTouchMode = false
-            setOnTouchListener { _, event -> event.action != MotionEvent.ACTION_CANCEL }
+            isClickable = interactive
+            isFocusable = interactive
+            isFocusableInTouchMode = interactive
+            if (!interactive) {
+                setOnTouchListener { _, event -> event.action != MotionEvent.ACTION_CANCEL }
+            }
             minZoomLevel = 3.0
             maxZoomLevel = 20.0
             controller.setZoom(6.0)
@@ -384,15 +726,14 @@ private fun RouteMap(points: List<RoutePoint>) {
 
     LaunchedEffect(points) {
         isMapLoading = true
+        fittedTripId = null
         delay(900L)
         isMapLoading = false
     }
 
     val mapShape = RoundedCornerShape(8.dp)
     Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(1.7f)
+        modifier = modifier
             .clip(mapShape)
             .background(Color(0xFFE8EDF2), mapShape),
     ) {
@@ -406,8 +747,14 @@ private fun RouteMap(points: List<RoutePoint>) {
                 if (points.size >= 2) {
                     val geoPoints = points.map { GeoPoint(it.latitude, it.longitude) }
                     view.overlays.add(
-                        Polyline().apply {
+                        Polyline(view).apply {
                             setPoints(geoPoints)
+                            setOnClickListener { polyline, map, eventPos ->
+                                onRoutePointSelected?.invoke(eventPos)
+                                polyline.setInfoWindowLocation(eventPos)
+                                map.invalidate()
+                                true
+                            }
                             outlinePaint.apply {
                                 color = AndroidColor.rgb(20, 108, 148)
                                 strokeWidth = 10f
@@ -420,6 +767,16 @@ private fun RouteMap(points: List<RoutePoint>) {
                             }
                         }
                     )
+                    selectedPoint?.let { point ->
+                        view.overlays.add(
+                            Marker(view).apply {
+                                position = GeoPoint(point.latitude, point.longitude)
+                                title = "Punto percorso"
+                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                                icon = selectedMarkerDrawable()
+                            }
+                        )
+                    }
                     view.overlays.add(
                         Marker(view).apply {
                             position = geoPoints.first()
@@ -436,8 +793,12 @@ private fun RouteMap(points: List<RoutePoint>) {
                             icon = endMarkerDrawable()
                         }
                     )
-                    view.post {
-                        view.zoomToBoundingBox(geoPoints.boundingBox(), true, 80)
+                    val fitKey = points.hashCode()
+                    if (fittedTripId != fitKey) {
+                        view.post {
+                            view.zoomToBoundingBox(geoPoints.boundingBox(), true, 80)
+                            fittedTripId = fitKey
+                        }
                     }
                 } else {
                     view.controller.setZoom(6.0)
@@ -526,27 +887,116 @@ private fun endMarkerDrawable(): Drawable = routeMarkerDrawable(
     label = "A",
 )
 
-private fun routeMarkerDrawable(fillColor: Int, label: String): Drawable {
-    val size = 48
+private fun selectedMarkerDrawable(): Drawable = routeMarkerDrawable(
+    fillColor = AndroidColor.rgb(245, 183, 0),
+    label = "i",
+    size = 76,
+    outerRadius = 36f,
+    innerRadius = 27f,
+    textSize = 28f,
+    textColor = AndroidColor.rgb(24, 33, 44),
+)
+
+private fun routeMarkerDrawable(
+    fillColor: Int,
+    label: String,
+    size: Int = 48,
+    outerRadius: Float = 22f,
+    innerRadius: Float = 16f,
+    textSize: Float = 18f,
+    textColor: Int = AndroidColor.WHITE,
+): Drawable {
     val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
     val canvas = AndroidCanvas(bitmap)
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
     paint.style = Paint.Style.FILL
-    paint.color = AndroidColor.WHITE
-    canvas.drawCircle(size / 2f, size / 2f, 22f, paint)
+    paint.color = textColor
+    canvas.drawCircle(size / 2f, size / 2f, outerRadius, paint)
 
     paint.color = fillColor
-    canvas.drawCircle(size / 2f, size / 2f, 16f, paint)
+    canvas.drawCircle(size / 2f, size / 2f, innerRadius, paint)
 
     paint.color = AndroidColor.WHITE
     paint.textAlign = Paint.Align.CENTER
-    paint.textSize = 18f
+    paint.textSize = textSize
     paint.isFakeBoldText = true
     val textY = size / 2f - (paint.descent() + paint.ascent()) / 2f
     canvas.drawText(label, size / 2f, textY, paint)
 
     return BitmapDrawable(null, bitmap)
+}
+
+private data class RoutePointInfo(
+    val index: Int,
+    val point: RoutePoint,
+    val distanceMeters: Float,
+    val timestampMillis: Long,
+    val elapsedMillis: Long,
+)
+
+private fun Trip.routePointInfoNear(position: GeoPoint): RoutePointInfo? {
+    if (points.isEmpty()) return null
+    var distanceMeters = 0f
+    var bestDistanceMeters = Float.MAX_VALUE
+    var bestRouteDistanceMeters = 0f
+    var bestIndex = 0
+    var bestPoint = points.first()
+
+    points.forEachIndexed { index, point ->
+        if (index > 0) {
+            distanceMeters += distanceBetween(points[index - 1], point)
+        }
+        val pointDistanceMeters = point.distanceTo(position)
+        if (pointDistanceMeters < bestDistanceMeters) {
+            bestDistanceMeters = pointDistanceMeters
+            bestRouteDistanceMeters = distanceMeters
+            bestIndex = index
+            bestPoint = point
+        }
+    }
+
+    return RoutePointInfo(
+        index = bestIndex,
+        point = bestPoint,
+        distanceMeters = bestRouteDistanceMeters,
+        timestampMillis = bestPoint.timestampMillis,
+        elapsedMillis = (bestPoint.timestampMillis - startMillis).coerceAtLeast(0L),
+    )
+}
+
+private fun Trip.routePointInfoAt(index: Int): RoutePointInfo? {
+    if (points.isEmpty()) return null
+    val pointIndex = index.coerceIn(points.indices)
+    val distanceMeters = points
+        .take(pointIndex + 1)
+        .zipWithNext()
+        .sumOf { (from, to) -> distanceBetween(from, to).toDouble() }
+        .toFloat()
+    val point = points[pointIndex]
+    return RoutePointInfo(
+        index = pointIndex,
+        point = point,
+        distanceMeters = distanceMeters,
+        timestampMillis = point.timestampMillis,
+        elapsedMillis = (point.timestampMillis - startMillis).coerceAtLeast(0L),
+    )
+}
+
+private fun formatTime(millis: Long): String {
+    val formatter = DateTimeFormatter.ofPattern("HH:mm", Locale.ITALIAN)
+    return Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(formatter)
+}
+
+private fun formatDate(millis: Long): String {
+    val formatter = DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ITALIAN)
+    return Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(formatter)
+}
+
+private fun RoutePoint.distanceTo(position: GeoPoint): Float {
+    val results = FloatArray(1)
+    Location.distanceBetween(latitude, longitude, position.latitude, position.longitude, results)
+    return results[0]
 }
 
 @Composable
