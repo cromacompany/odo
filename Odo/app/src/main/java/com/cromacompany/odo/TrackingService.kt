@@ -33,6 +33,13 @@ class TrackingService : Service() {
     private var stoppedSinceMillis: Long? = null
     private var isRecording = false
     private val heartbeatHandler = Handler(Looper.getMainLooper())
+    private val stopConfirmationRunnable = Runnable {
+        val stoppedAt = stoppedSinceMillis ?: return@Runnable
+        if (isRecording) {
+            logger.event("Automatic stop for parked vehicle", mapOf("stoppedAtMillis" to stoppedAt))
+            finishTripIfNeeded(stoppedAt)
+        }
+    }
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             trackingStateStore.recordHeartbeat()
@@ -49,14 +56,14 @@ class TrackingService : Service() {
     override fun onCreate() {
         super.onCreate()
         logger = EventLogger.get(this)
-        logger.event("TrackingService creato")
+        logger.event("TrackingService created")
         repository = TripRepositoryProvider.get(this)
         trackingStateStore = TrackingStateStore.get(this)
         trackingStateStore.setMonitoring(true)
         trackingStateStore.recordHeartbeat()
         fusedLocationProviderClient = LocationServices.getFusedLocationProviderClient(this)
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Monitoraggio automatico attivo"))
+        startForeground(NOTIFICATION_ID, buildNotification("Automatic monitoring active"))
         startHeartbeat()
         startLocationUpdates()
     }
@@ -64,12 +71,12 @@ class TrackingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                logger.event("Stop manuale dal servizio")
-                finishTripIfNeeded(System.currentTimeMillis())
+                logger.event("Manual stop from service")
+                finishTripIfNeeded(stoppedSinceMillis ?: System.currentTimeMillis())
                 trackingStateStore.setMonitoring(false)
                 stopSelf()
             }
-            else -> logger.event("TrackingService avviato", mapOf("startId" to startId))
+            else -> logger.event("TrackingService started", mapOf("startId" to startId))
         }
         return START_STICKY
     }
@@ -77,8 +84,9 @@ class TrackingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        logger.event("TrackingService distrutto", mapOf("isRecording" to isRecording, "points" to currentPoints.size))
+        logger.event("TrackingService destroyed", mapOf("isRecording" to isRecording, "points" to currentPoints.size))
         heartbeatHandler.removeCallbacks(heartbeatRunnable)
+        heartbeatHandler.removeCallbacks(stopConfirmationRunnable)
         trackingStateStore.setMonitoring(false)
         fusedLocationProviderClient.removeLocationUpdates(locationCallback)
         super.onDestroy()
@@ -91,7 +99,7 @@ class TrackingService : Service() {
 
     private fun startLocationUpdates() {
         if (!hasLocationPermission()) {
-            logger.error("Permessi posizione mancanti: impossibile avviare aggiornamenti GPS")
+            logger.error("Location permissions missing: unable to start GPS updates")
             trackingStateStore.setMonitoring(false)
             stopSelf()
             return
@@ -104,7 +112,7 @@ class TrackingService : Service() {
             fusedLocationProviderClient.requestLocationUpdates(request, locationCallback, mainLooper)
                 .addOnSuccessListener {
                     logger.event(
-                        "Aggiornamenti GPS avviati",
+                        "GPS updates started",
                         mapOf(
                             "intervalMillis" to LOCATION_INTERVAL_MILLIS,
                             "minDistanceMeters" to MIN_DISTANCE_METERS,
@@ -112,12 +120,12 @@ class TrackingService : Service() {
                     )
                 }
                 .addOnFailureListener { throwable ->
-                    logger.error("Errore avvio aggiornamenti GPS", throwable)
+                    logger.error("GPS update startup error", throwable)
                     trackingStateStore.setMonitoring(false)
                     stopSelf()
                 }
         }.onFailure { throwable ->
-            logger.error("Eccezione richiesta aggiornamenti GPS", throwable)
+            logger.error("GPS update request exception", throwable)
             trackingStateStore.setMonitoring(false)
             stopSelf()
         }
@@ -131,7 +139,7 @@ class TrackingService : Service() {
     private fun handleLocation(location: Location) {
         if (location.accuracy > MAX_ACCURACY_METERS) {
             logger.event(
-                "Posizione ignorata per bassa precisione",
+                "Location ignored due to low accuracy",
                 mapOf("accuracyMeters" to location.accuracy, "maxAccuracyMeters" to MAX_ACCURACY_METERS),
             )
             return
@@ -175,16 +183,29 @@ class TrackingService : Service() {
             }
 
             if (speedMetersPerSecond <= STOP_SPEED_METERS_PER_SECOND) {
-                stoppedSinceMillis = stoppedSinceMillis ?: now
-                if (now - (stoppedSinceMillis ?: now) >= STOP_CONFIRMATION_MILLIS) {
-                    finishTripIfNeeded(now)
+                if (stoppedSinceMillis == null) {
+                    stoppedSinceMillis = now
+                    scheduleStopConfirmation(now)
+                }
+                val stoppedAt = stoppedSinceMillis ?: now
+                if (now - stoppedAt >= STOP_CONFIRMATION_MILLIS) {
+                    logger.event("Automatic stop for parked vehicle", mapOf("stoppedAtMillis" to stoppedAt))
+                    finishTripIfNeeded(stoppedAt)
                 }
             } else {
                 stoppedSinceMillis = null
+                heartbeatHandler.removeCallbacks(stopConfirmationRunnable)
             }
 
             updateNotification()
         }
+    }
+
+    private fun scheduleStopConfirmation(stoppedAtMillis: Long) {
+        heartbeatHandler.removeCallbacks(stopConfirmationRunnable)
+        val delayMillis = (stoppedAtMillis + STOP_CONFIRMATION_MILLIS - System.currentTimeMillis())
+            .coerceAtLeast(0L)
+        heartbeatHandler.postDelayed(stopConfirmationRunnable, delayMillis)
     }
 
     private fun startTrip(startMillis: Long) {
@@ -192,13 +213,14 @@ class TrackingService : Service() {
         currentTripStartMillis = startMillis
         currentPoints.clear()
         stoppedSinceMillis = null
-        logger.event("Viaggio avviato", mapOf("startMillis" to startMillis))
+        logger.event("Trip started", mapOf("startMillis" to startMillis))
         updateNotification()
     }
 
     private fun finishTripIfNeeded(endMillis: Long) {
         if (!isRecording) return
-        val points = currentPoints.toList()
+        heartbeatHandler.removeCallbacks(stopConfirmationRunnable)
+        val points = currentPoints.filter { it.timestampMillis <= endMillis }
         if (points.size >= MIN_TRIP_POINTS && endMillis - currentTripStartMillis >= MIN_TRIP_DURATION_MILLIS) {
             val distanceMeters = points.zipWithNext().sumOf { (from, to) -> distanceBetween(from, to).toDouble() }.toFloat()
             val trafficCondition = estimateTraffic(points, distanceMeters, endMillis - currentTripStartMillis)
@@ -211,7 +233,7 @@ class TrackingService : Service() {
             )
             repository.addTrip(trip)
             logger.event(
-                "Viaggio salvato",
+                "Trip saved",
                 mapOf(
                     "tripId" to trip.id,
                     "durationMillis" to trip.durationMillis,
@@ -222,7 +244,7 @@ class TrackingService : Service() {
             )
         } else {
             logger.event(
-                "Viaggio scartato per dati insufficienti",
+                "Trip discarded due to insufficient data",
                 mapOf(
                     "durationMillis" to (endMillis - currentTripStartMillis),
                     "points" to points.size,
@@ -241,9 +263,9 @@ class TrackingService : Service() {
 
     private fun updateNotification() {
         val status = if (isRecording) {
-            "Registrazione viaggio: ${formatDuration(System.currentTimeMillis() - currentTripStartMillis)}"
+            "Recording trip: ${formatDuration(System.currentTimeMillis() - currentTripStartMillis)}"
         } else {
-            "Monitoraggio automatico attivo"
+            "Automatic monitoring active"
         }
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildNotification(status))
@@ -264,7 +286,7 @@ class TrackingService : Service() {
         )
         .addAction(
             android.R.drawable.ic_media_pause,
-            "Ferma",
+            "Stop",
             PendingIntent.getService(
                 this,
                 1,
@@ -278,7 +300,7 @@ class TrackingService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Monitoraggio viaggi",
+                "Trip monitoring",
                 NotificationManager.IMPORTANCE_LOW,
             )
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)

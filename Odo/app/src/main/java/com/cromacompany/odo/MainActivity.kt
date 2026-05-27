@@ -14,6 +14,7 @@ import android.location.Location
 import android.os.Build
 import android.os.Bundle
 import android.view.MotionEvent
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -23,6 +24,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -43,15 +45,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -68,6 +73,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -95,9 +101,29 @@ import java.util.Locale
 import kotlin.math.roundToInt
 import android.graphics.Color as AndroidColor
 
-private val TitleColor = Color(0xFF18212C)
-private val BodyColor = Color(0xFF2D3743)
-private val SecondaryTextColor = Color(0xFF4F5B68)
+private enum class ThemeMode(val label: String) {
+    System("System"),
+    Light("Light"),
+    Dark("Dark"),
+}
+
+private const val ThemePreferencesName = "odo_theme_preferences"
+private const val ThemeModeKey = "theme_mode"
+
+private val TitleColor: Color
+    @Composable get() = MaterialTheme.colorScheme.onSurface
+private val BodyColor: Color
+    @Composable get() = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f)
+private val SecondaryTextColor: Color
+    @Composable get() = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f)
+private val AppBackgroundColor: Color
+    @Composable get() = MaterialTheme.colorScheme.background
+private val AppSurfaceColor: Color
+    @Composable get() = MaterialTheme.colorScheme.surface
+private val AppMetricColor: Color
+    @Composable get() = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) Color(0xFF222D38) else Color(0xFFF1F4F7)
+private val SelectedTripColor: Color
+    @Composable get() = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) Color(0xFF173142) else Color(0xFFE4F1F8)
 private val SimpleRoadMapTileSource = XYTileSource(
     "CartoDB Positron",
     0,
@@ -115,22 +141,46 @@ private val SimpleRoadMapTileSource = XYTileSource(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        EventLogger.get(this).event("MainActivity creata")
-        enableEdgeToEdge()
+        EventLogger.get(this).event("MainActivity created")
         setContent {
-            OdoTheme {
-                OdoApp()
+            val context = LocalContext.current
+            var themeMode by rememberSaveable { mutableStateOf(context.readThemeMode()) }
+            val darkTheme = when (themeMode) {
+                ThemeMode.System -> isSystemInDarkTheme()
+                ThemeMode.Light -> false
+                ThemeMode.Dark -> true
+            }
+            SideEffect {
+                val style = if (darkTheme) {
+                    SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+                } else {
+                    SystemBarStyle.light(AndroidColor.TRANSPARENT, AndroidColor.TRANSPARENT)
+                }
+                enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+            }
+            OdoTheme(darkTheme = darkTheme) {
+                OdoApp(
+                    themeMode = themeMode,
+                    onThemeModeChange = { mode ->
+                        themeMode = mode
+                        context.writeThemeMode(mode)
+                    },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun OdoApp() {
+private fun OdoApp(
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+) {
     val context = LocalContext.current
     val logger = remember { EventLogger.get(context) }
     val repository = remember { TripRepositoryProvider.get(context) }
     val trackingStateStore = remember { TrackingStateStore.get(context) }
+    val appVersionLabel = remember { context.appVersionLabel() }
     val trips by repository.trips.collectAsState()
     val trackingSnapshot by trackingStateStore.snapshot.collectAsState()
     var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -138,21 +188,24 @@ private fun OdoApp() {
     var logSizeLabel by remember { mutableStateOf(logger.fileSizeLabel()) }
     var selectedTripId by rememberSaveable { mutableStateOf<String?>(null) }
     var detailTripId by rememberSaveable { mutableStateOf<String?>(null) }
+    var mapTripId by rememberSaveable { mutableStateOf<String?>(null) }
     var isSettingsOpen by rememberSaveable { mutableStateOf(false) }
+    var isHistoryOpen by rememberSaveable { mutableStateOf(false) }
     val selectedTrip = trips.firstOrNull { it.id == selectedTripId } ?: trips.firstOrNull()
     val detailTrip = trips.firstOrNull { it.id == detailTripId }
+    val mapTrip = trips.firstOrNull { it.id == mapTripId }
     val permissions = remember { requiredPermissions() }
     var hasPermissions by remember { mutableStateOf(context.hasRequiredPermissions(permissions)) }
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { results ->
         hasPermissions = results.values.all { it }
-        logger.event("Risultato richiesta permessi", results)
+        logger.event("Permission request result", results)
         if (hasPermissions) {
             context.startTrackingService()
             trackingStateStore.setMonitoring(true)
         } else {
-            logger.error("Permessi negati: monitoraggio non avviato", details = results)
+            logger.error("Permissions denied: monitoring not started", details = results)
         }
         logSizeLabel = logger.fileSizeLabel()
     }
@@ -172,27 +225,27 @@ private fun OdoApp() {
     val onStartMonitoring = {
         if (context.hasRequiredPermissions(permissions)) {
             hasPermissions = true
-            logger.event("Avvio monitoraggio richiesto da UI")
+            logger.event("Monitoring start requested from UI")
             context.startTrackingService()
             trackingStateStore.setMonitoring(true)
         } else {
-            logger.event("Richiesta permessi da UI")
+            logger.event("Permission request from UI")
             permissionLauncher.launch(permissions)
         }
         logSizeLabel = logger.fileSizeLabel()
     }
     val onStopMonitoring = {
-        logger.event("Stop monitoraggio richiesto da UI")
+        logger.event("Monitoring stop requested from UI")
         context.stopTrackingService()
         trackingStateStore.setMonitoring(false)
         logSizeLabel = logger.fileSizeLabel()
     }
     val onShareLog = {
         runCatching {
-            logger.event("Condivisione log richiesta da UI")
-            context.startActivity(Intent.createChooser(logger.shareIntent(), "Condividi log Odo"))
+            logger.event("Log sharing requested from UI")
+            context.startActivity(Intent.createChooser(logger.shareIntent(), "Share Odo log"))
         }.onFailure { throwable ->
-            logger.error("Errore condivisione log", throwable)
+            logger.error("Log sharing error", throwable)
         }
         logSizeLabel = logger.fileSizeLabel()
     }
@@ -201,20 +254,37 @@ private fun OdoApp() {
         logSizeLabel = logger.fileSizeLabel()
     }
 
-    BackHandler(enabled = detailTrip != null || isSettingsOpen) {
-        if (detailTrip != null) {
+    BackHandler(enabled = mapTrip != null || detailTrip != null || isSettingsOpen || isHistoryOpen) {
+        if (mapTrip != null) {
+            mapTripId = null
+        } else if (detailTrip != null) {
             detailTripId = null
+        } else if (isHistoryOpen) {
+            isHistoryOpen = false
         } else {
             isSettingsOpen = false
         }
     }
 
-    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        containerColor = AppBackgroundColor,
+    ) { innerPadding ->
+        if (mapTrip != null) {
+            RouteMapScreen(
+                trip = mapTrip,
+                modifier = Modifier.padding(innerPadding),
+                onBack = { mapTripId = null },
+            )
+            return@Scaffold
+        }
+
         if (detailTrip != null) {
-            RouteDetailScreen(
+            TripDetailScreen(
                 trip = detailTrip,
                 modifier = Modifier.padding(innerPadding),
                 onBack = { detailTripId = null },
+                onOpenMap = { mapTripId = detailTrip.id },
             )
             return@Scaffold
         }
@@ -224,12 +294,28 @@ private fun OdoApp() {
                 hasPermissions = hasPermissions,
                 isMonitoring = isMonitoring,
                 logSizeLabel = logSizeLabel,
+                appVersionLabel = appVersionLabel,
+                themeMode = themeMode,
                 modifier = Modifier.padding(innerPadding),
                 onBack = { isSettingsOpen = false },
                 onStart = onStartMonitoring,
                 onStop = onStopMonitoring,
                 onShareLog = onShareLog,
                 onClearLog = onClearLog,
+                onThemeModeChange = onThemeModeChange,
+            )
+            return@Scaffold
+        }
+
+        if (isHistoryOpen) {
+            TripHistoryScreen(
+                trips = trips.drop(3),
+                modifier = Modifier.padding(innerPadding),
+                onBack = { isHistoryOpen = false },
+                onOpenTrip = { trip ->
+                    selectedTripId = trip.id
+                    detailTripId = trip.id
+                },
             )
             return@Scaffold
         }
@@ -237,7 +323,7 @@ private fun OdoApp() {
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xFFF6F7F9))
+                .background(AppBackgroundColor)
                 .padding(innerPadding)
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -257,17 +343,15 @@ private fun OdoApp() {
                 SelectedTripCard(
                     trip = selectedTrip,
                     onOpenMap = {
-                        if (selectedTrip != null) detailTripId = selectedTrip.id
+                        if (selectedTrip != null) mapTripId = selectedTrip.id
                     },
                 )
             }
 
             item {
-                Text(
-                    text = "Storico viaggi",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = TitleColor,
+                HistorySectionHeader(
+                    showArchive = trips.size > 3,
+                    onOpenArchive = { isHistoryOpen = true },
                 )
             }
 
@@ -276,11 +360,99 @@ private fun OdoApp() {
                     EmptyHistory()
                 }
             } else {
-                items(trips, key = { it.id }) { trip ->
+                items(trips.take(3), key = { it.id }) { trip ->
                     TripRow(
                         trip = trip,
                         isSelected = trip.id == selectedTrip?.id,
-                        onClick = { selectedTripId = trip.id },
+                        onClick = {
+                            selectedTripId = trip.id
+                            detailTripId = trip.id
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistorySectionHeader(showArchive: Boolean, onOpenArchive: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "Trip history",
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = TitleColor,
+        )
+        if (showArchive) {
+            TextButton(onClick = onOpenArchive) {
+                Text("View all")
+            }
+        }
+    }
+}
+
+@Composable
+private fun TripHistoryScreen(
+    trips: List<Trip>,
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit,
+    onOpenTrip: (Trip) -> Unit,
+) {
+    val tripsByDate = remember(trips) { trips.groupBy { formatDate(it.startMillis) } }
+
+    LazyColumn(
+        modifier = modifier
+            .fillMaxSize()
+            .background(AppBackgroundColor)
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Trip archive",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = TitleColor,
+                    )
+                    Text(
+                        text = "${trips.size} previous trips",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = SecondaryTextColor,
+                    )
+                }
+                IconButton(onClick = onBack) {
+                    BackArrowIcon()
+                }
+            }
+        }
+
+        if (trips.isEmpty()) {
+            item {
+                EmptyHistory()
+            }
+        } else {
+            tripsByDate.forEach { (dateLabel, dateTrips) ->
+                item(key = "date-$dateLabel") {
+                    Text(
+                        text = dateLabel,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = SecondaryTextColor,
+                    )
+                }
+                items(dateTrips, key = { it.id }) { trip ->
+                    TripRow(
+                        trip = trip,
+                        isSelected = false,
+                        onClick = { onOpenTrip(trip) },
                     )
                 }
             }
@@ -315,7 +487,7 @@ private fun ServiceClosedWarning() {
         shape = RoundedCornerShape(8.dp),
     ) {
         Text(
-            text = "Servizio spento: i viaggi non vengono registrati.",
+            text = "Service off: trips are not being recorded.",
             modifier = Modifier.padding(12.dp),
             color = Color(0xFF8A3D00),
             style = MaterialTheme.typography.bodyMedium,
@@ -329,17 +501,20 @@ private fun SettingsScreen(
     hasPermissions: Boolean,
     isMonitoring: Boolean,
     logSizeLabel: String,
+    appVersionLabel: String,
+    themeMode: ThemeMode,
     modifier: Modifier = Modifier,
     onBack: () -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onShareLog: () -> Unit,
     onClearLog: () -> Unit,
+    onThemeModeChange: (ThemeMode) -> Unit,
 ) {
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFFF6F7F9))
+            .background(AppBackgroundColor)
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
@@ -367,19 +542,28 @@ private fun SettingsScreen(
             )
         }
         item {
+            ThemeModeCard(
+                themeMode = themeMode,
+                onThemeModeChange = onThemeModeChange,
+            )
+        }
+        item {
             LogExportCard(
                 fileSizeLabel = logSizeLabel,
                 onShare = onShareLog,
                 onClear = onClearLog,
             )
         }
+        item {
+            AppInfoCard(versionLabel = appVersionLabel)
+        }
     }
 }
 
 @Composable
 private fun SettingsGearIcon() {
+    val color = TitleColor
     Canvas(modifier = Modifier.size(24.dp)) {
-        val color = TitleColor
         val stroke = 2.1.dp.toPx()
         val center = Offset(size.width / 2f, size.height / 2f)
         val radius = 6.5.dp.toPx()
@@ -401,13 +585,74 @@ private fun SettingsGearIcon() {
 
 @Composable
 private fun BackArrowIcon() {
+    val color = TitleColor
     Canvas(modifier = Modifier.size(24.dp)) {
-        val color = TitleColor
         val stroke = 2.4.dp.toPx()
         val y = size.height / 2f
         drawLine(color, Offset(7.dp.toPx(), y), Offset(20.dp.toPx(), y), stroke, cap = StrokeCap.Round)
         drawLine(color, Offset(7.dp.toPx(), y), Offset(13.dp.toPx(), 6.dp.toPx()), stroke, cap = StrokeCap.Round)
         drawLine(color, Offset(7.dp.toPx(), y), Offset(13.dp.toPx(), 18.dp.toPx()), stroke, cap = StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun ThemeModeCard(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> Unit) {
+    val followsSystem = themeMode == ThemeMode.System
+    val darkEnabled = themeMode == ThemeMode.Dark
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = AppSurfaceColor,
+        shape = RoundedCornerShape(8.dp),
+        tonalElevation = 1.dp,
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Theme", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TitleColor)
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(AppMetricColor, RoundedCornerShape(8.dp))
+                    .clickable { onThemeModeChange(if (followsSystem) ThemeMode.Light else ThemeMode.System) }
+                    .padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Use phone theme", color = TitleColor, fontWeight = FontWeight.SemiBold)
+                    Text("Follows the device light/dark setting", color = SecondaryTextColor, style = MaterialTheme.typography.bodySmall)
+                }
+                Checkbox(
+                    checked = followsSystem,
+                    onCheckedChange = { checked ->
+                        onThemeModeChange(if (checked) ThemeMode.System else ThemeMode.Light)
+                    },
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(if (followsSystem) AppMetricColor.copy(alpha = 0.55f) else AppMetricColor, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Dark mode", color = if (followsSystem) SecondaryTextColor else TitleColor, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = if (followsSystem) "Disabled by system theme" else if (darkEnabled) "Dark theme active" else "Light theme active",
+                        color = SecondaryTextColor,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = darkEnabled,
+                    enabled = !followsSystem,
+                    onCheckedChange = { checked ->
+                        onThemeModeChange(if (checked) ThemeMode.Dark else ThemeMode.Light)
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -419,16 +664,16 @@ private fun LogExportCard(
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        color = Color.White,
+        color = AppSurfaceColor,
         shape = RoundedCornerShape(8.dp),
         tonalElevation = 1.dp,
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Log eventi", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TitleColor)
+                    Text("Event log", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TitleColor)
                     Text(
-                        text = "File esportabile .txt • $fileSizeLabel",
+                        text = "Exportable .txt file • $fileSizeLabel",
                         style = MaterialTheme.typography.bodySmall,
                         color = SecondaryTextColor,
                     )
@@ -436,14 +681,60 @@ private fun LogExportCard(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = onShare) {
-                    Text("Condividi .txt")
+                    Text("Share .txt")
                 }
                 TextButton(onClick = onClear) {
-                    Text("Svuota")
+                    Text("Clear")
                 }
             }
         }
     }
+}
+
+@Composable
+private fun AppInfoCard(versionLabel: String) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = AppSurfaceColor,
+        shape = RoundedCornerShape(8.dp),
+        tonalElevation = 1.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "App version",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = TitleColor,
+            )
+            Text(
+                text = versionLabel,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = SecondaryTextColor,
+            )
+        }
+    }
+}
+
+private fun Context.appVersionLabel(): String {
+    val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+    } else {
+        @Suppress("DEPRECATION")
+        packageManager.getPackageInfo(packageName, 0)
+    }
+    val versionName = packageInfo.versionName ?: "unknown"
+    val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        packageInfo.longVersionCode
+    } else {
+        @Suppress("DEPRECATION")
+        packageInfo.versionCode.toLong()
+    }
+    return "$versionName ($versionCode)"
 }
 
 @Composable
@@ -455,7 +746,7 @@ private fun Header(
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        color = Color.White,
+        color = AppSurfaceColor,
         shape = RoundedCornerShape(8.dp),
         tonalElevation = 1.dp,
     ) {
@@ -464,7 +755,7 @@ private fun Header(
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Odo", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = TitleColor)
                     Text(
-                        text = if (isMonitoring) "Pronto a registrare automaticamente i viaggi in auto" else "Monitoraggio non attivo",
+                        text = if (isMonitoring) "Ready to automatically record car trips" else "Monitoring is not active",
                         style = MaterialTheme.typography.bodyMedium,
                         color = SecondaryTextColor,
                     )
@@ -473,17 +764,17 @@ private fun Header(
             }
             if (!hasPermissions) {
                 Text(
-                    text = "Servono posizione e notifiche per registrare i percorsi mentre guidi.",
+                    text = "Location and notifications are required to record routes while you drive.",
                     color = Color(0xFF9A5B00),
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = onStart, enabled = !isMonitoring) {
-                    Text(if (hasPermissions) "Avvia monitoraggio" else "Consenti e avvia")
+                    Text(if (hasPermissions) "Start monitoring" else "Allow and start")
                 }
                 TextButton(onClick = onStop, enabled = isMonitoring) {
-                    Text("Ferma")
+                    Text("Stop")
                 }
             }
         }
@@ -499,7 +790,7 @@ private fun StatusPill(isMonitoring: Boolean) {
             .padding(horizontal = 10.dp, vertical = 6.dp),
     ) {
         Text(
-            text = if (isMonitoring) "Attivo" else "Spento",
+            text = if (isMonitoring) "Active" else "Off",
             color = color,
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.SemiBold,
@@ -510,18 +801,19 @@ private fun StatusPill(isMonitoring: Boolean) {
 @Composable
 private fun SelectedTripCard(trip: Trip?, onOpenMap: () -> Unit = {}) {
     Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = trip != null, onClick = onOpenMap),
-        color = Color.White,
+        modifier = Modifier.fillMaxWidth(),
+        color = AppSurfaceColor,
         shape = RoundedCornerShape(8.dp),
         tonalElevation = 1.dp,
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Percorso", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TitleColor)
-            RouteMap(points = trip?.points.orEmpty())
+            Text("Route", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TitleColor)
+            RouteMap(
+                points = trip?.points.orEmpty(),
+                onMapClick = if (trip != null) onOpenMap else null,
+            )
             if (trip == null) {
-                Text("Nessun viaggio registrato.", color = SecondaryTextColor)
+                Text("No trips recorded.", color = SecondaryTextColor)
             } else {
                 TripMetrics(trip)
             }
@@ -530,20 +822,83 @@ private fun SelectedTripCard(trip: Trip?, onOpenMap: () -> Unit = {}) {
 }
 
 @Composable
-private fun RouteDetailScreen(trip: Trip, modifier: Modifier = Modifier, onBack: () -> Unit) {
+private fun TripDetailScreen(
+    trip: Trip,
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit,
+    onOpenMap: () -> Unit,
+) {
+    LazyColumn(
+        modifier = modifier
+            .fillMaxSize()
+            .background(AppBackgroundColor)
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Trip details", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = TitleColor)
+                    Text(
+                        text = "${formatDate(trip.startMillis)}, ${formatTime(trip.startMillis)} - ${formatTime(trip.endMillis)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = SecondaryTextColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                IconButton(onClick = onBack) {
+                    BackArrowIcon()
+                }
+            }
+        }
+
+        item {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = AppSurfaceColor,
+                shape = RoundedCornerShape(8.dp),
+                tonalElevation = 1.dp,
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Route", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TitleColor)
+                    RouteMap(points = trip.points, onMapClick = onOpenMap)
+                }
+            }
+        }
+
+        item {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = AppSurfaceColor,
+                shape = RoundedCornerShape(8.dp),
+                tonalElevation = 1.dp,
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Trip data", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = TitleColor)
+                    TripMetrics(trip)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RouteMapScreen(trip: Trip, modifier: Modifier = Modifier, onBack: () -> Unit) {
     var selectedRoutePoint by remember(trip.id) { mutableStateOf(trip.routePointInfoAt(0)) }
     val lastPointIndex = (trip.points.size - 1).coerceAtLeast(0)
 
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFFF6F7F9))
+            .background(AppBackgroundColor)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Percorso", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = TitleColor)
+                Text("Route", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = TitleColor)
                 Text(
                     text = "${formatDate(trip.startMillis)}, ${formatTime(trip.startMillis)} - ${formatTime(trip.endMillis)}, ${formatDuration(trip.durationMillis)}",
                     style = MaterialTheme.typography.bodyMedium,
@@ -560,7 +915,7 @@ private fun RouteDetailScreen(trip: Trip, modifier: Modifier = Modifier, onBack:
         selectedRoutePoint?.let { pointInfo ->
             Surface(
                 modifier = Modifier.fillMaxWidth(),
-                color = Color.White,
+                color = AppSurfaceColor,
                 shape = RoundedCornerShape(8.dp),
                 tonalElevation = 1.dp,
             ) {
@@ -570,8 +925,8 @@ private fun RouteDetailScreen(trip: Trip, modifier: Modifier = Modifier, onBack:
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     CompactRouteValue("Km", formatDistance(pointInfo.distanceMeters))
-                    CompactRouteValue("Ora", formatTime(pointInfo.timestampMillis))
-                    CompactRouteValue("Tempo", formatDuration(pointInfo.elapsedMillis))
+                    CompactRouteValue("Time", formatTime(pointInfo.timestampMillis))
+                    CompactRouteValue("Elapsed", formatDuration(pointInfo.elapsedMillis))
                 }
             }
         }
@@ -693,6 +1048,7 @@ private fun RouteMap(
     interactive: Boolean = false,
     selectedPoint: RoutePoint? = null,
     onRoutePointSelected: ((GeoPoint) -> Unit)? = null,
+    onMapClick: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     var isMapLoading by remember(points) { mutableStateOf(true) }
@@ -706,9 +1062,6 @@ private fun RouteMap(
             isClickable = interactive
             isFocusable = interactive
             isFocusableInTouchMode = interactive
-            if (!interactive) {
-                setOnTouchListener { _, event -> event.action != MotionEvent.ACTION_CANCEL }
-            }
             minZoomLevel = 3.0
             maxZoomLevel = 20.0
             controller.setZoom(6.0)
@@ -743,6 +1096,16 @@ private fun RouteMap(
                 .clip(mapShape),
             factory = { mapView },
             update = { view ->
+                if (interactive) {
+                    view.setOnTouchListener(null)
+                } else {
+                    view.setOnTouchListener { _, event ->
+                        if (event.action == MotionEvent.ACTION_UP) {
+                            onMapClick?.invoke()
+                        }
+                        event.action != MotionEvent.ACTION_CANCEL
+                    }
+                }
                 view.overlays.clear()
                 if (points.size >= 2) {
                     val geoPoints = points.map { GeoPoint(it.latitude, it.longitude) }
@@ -771,7 +1134,7 @@ private fun RouteMap(
                         view.overlays.add(
                             Marker(view).apply {
                                 position = GeoPoint(point.latitude, point.longitude)
-                                title = "Punto percorso"
+                                title = "Route point"
                                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                                 icon = selectedMarkerDrawable()
                             }
@@ -780,7 +1143,7 @@ private fun RouteMap(
                     view.overlays.add(
                         Marker(view).apply {
                             position = geoPoints.first()
-                            title = "Partenza"
+                            title = "Start"
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                             icon = startMarkerDrawable()
                         }
@@ -788,7 +1151,7 @@ private fun RouteMap(
                     view.overlays.add(
                         Marker(view).apply {
                             position = geoPoints.last()
-                            title = "Arrivo"
+                            title = "Finish"
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                             icon = endMarkerDrawable()
                         }
@@ -856,10 +1219,10 @@ private fun MapLoadingPlaceholder(modifier: Modifier = Modifier) {
             drawCircle(Color(0xFFB6C1CC), radius = 12f, center = Offset(size.width * 0.5f, size.height * 0.5f))
         }
         Text(
-            text = "Caricamento mappa",
+            text = "Loading map",
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .background(Color.White.copy(alpha = 0.86f), RoundedCornerShape(8.dp))
+                .background(AppSurfaceColor.copy(alpha = 0.86f), RoundedCornerShape(8.dp))
                 .padding(horizontal = 10.dp, vertical = 6.dp),
             color = SecondaryTextColor,
             style = MaterialTheme.typography.labelMedium,
@@ -984,12 +1347,12 @@ private fun Trip.routePointInfoAt(index: Int): RoutePointInfo? {
 }
 
 private fun formatTime(millis: Long): String {
-    val formatter = DateTimeFormatter.ofPattern("HH:mm", Locale.ITALIAN)
+    val formatter = DateTimeFormatter.ofPattern("HH:mm", Locale.ENGLISH)
     return Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(formatter)
 }
 
 private fun formatDate(millis: Long): String {
-    val formatter = DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ITALIAN)
+    val formatter = DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH)
     return Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(formatter)
 }
 
@@ -1002,26 +1365,26 @@ private fun RoutePoint.distanceTo(position: GeoPoint): Float {
 @Composable
 private fun TripMetrics(trip: Trip) {
     val context = LocalContext.current
-    var startPlace by remember(trip.id) { mutableStateOf("Rilevamento luogo...") }
-    var endPlace by remember(trip.id) { mutableStateOf("Rilevamento luogo...") }
+    var startPlace by remember(trip.id) { mutableStateOf("Detecting place...") }
+    var endPlace by remember(trip.id) { mutableStateOf("Detecting place...") }
 
     LaunchedEffect(trip.id, trip.points) {
         val startPoint = trip.points.firstOrNull()
         val endPoint = trip.points.lastOrNull()
-        startPlace = startPoint?.let { context.resolvePlaceLabel(it) } ?: "Luogo non disponibile"
-        endPlace = endPoint?.let { context.resolvePlaceLabel(it) } ?: "Luogo non disponibile"
+        startPlace = startPoint?.let { context.resolvePlaceLabel(it) } ?: "Place unavailable"
+        endPlace = endPoint?.let { context.resolvePlaceLabel(it) } ?: "Place unavailable"
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Metric("Inizio", formatDateTime(trip.startMillis), Modifier.weight(1f), detail = startPlace)
-            Metric("Arrivo", formatDateTime(trip.endMillis), Modifier.weight(1f), detail = endPlace)
+            Metric("Start", formatDateTime(trip.startMillis), Modifier.weight(1f), detail = startPlace)
+            Metric("Finish", formatDateTime(trip.endMillis), Modifier.weight(1f), detail = endPlace)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Metric("Durata", formatDuration(trip.durationMillis), Modifier.weight(1f))
-            Metric("Distanza", formatDistance(trip.distanceMeters), Modifier.weight(1f))
+            Metric("Duration", formatDuration(trip.durationMillis), Modifier.weight(1f))
+            Metric("Distance", formatDistance(trip.distanceMeters), Modifier.weight(1f))
         }
-        Metric("Traffico", trip.trafficCondition.label, Modifier.fillMaxWidth())
+        Metric("Traffic", trip.trafficCondition.label, Modifier.fillMaxWidth())
     }
 }
 
@@ -1029,7 +1392,7 @@ private fun TripMetrics(trip: Trip) {
 private fun Metric(label: String, value: String, modifier: Modifier = Modifier, detail: String? = null) {
     Column(
         modifier = modifier
-            .background(Color(0xFFF1F4F7), RoundedCornerShape(8.dp))
+            .background(AppMetricColor, RoundedCornerShape(8.dp))
             .padding(10.dp),
     ) {
         Text(label, style = MaterialTheme.typography.labelSmall, color = SecondaryTextColor)
@@ -1050,7 +1413,7 @@ private fun Metric(label: String, value: String, modifier: Modifier = Modifier, 
 private suspend fun Context.resolvePlaceLabel(point: RoutePoint): String = withContext(Dispatchers.IO) {
     runCatching {
         @Suppress("DEPRECATION")
-        val address = Geocoder(this@resolvePlaceLabel, Locale.ITALIAN)
+        val address = Geocoder(this@resolvePlaceLabel, Locale.ENGLISH)
             .getFromLocation(point.latitude, point.longitude, 1)
             ?.firstOrNull()
         address?.let {
@@ -1070,7 +1433,7 @@ private suspend fun Context.resolvePlaceLabel(point: RoutePoint): String = withC
 }
 
 private fun RoutePoint.coordinateLabel(): String {
-    return String.format(Locale.ITALIAN, "%.5f, %.5f", latitude, longitude)
+    return String.format(Locale.ENGLISH, "%.5f, %.5f", latitude, longitude)
 }
 
 @Composable
@@ -1080,7 +1443,7 @@ private fun TripRow(trip: Trip, isSelected: Boolean, onClick: () -> Unit) {
             .fillMaxWidth()
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = if (isSelected) Color(0xFFE4F1F8) else Color.White),
+        colors = CardDefaults.cardColors(containerColor = if (isSelected) SelectedTripColor else AppSurfaceColor),
     ) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -1146,9 +1509,9 @@ private fun MiniRoute(points: List<RoutePoint>) {
 
 @Composable
 private fun EmptyHistory() {
-    Surface(color = Color.White, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+    Surface(color = AppSurfaceColor, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
         Text(
-            text = "Avvia il monitoraggio. Il primo viaggio comparira qui dopo almeno un minuto di guida e una fermata di circa tre minuti.",
+            text = "Start monitoring. The first trip will appear here after at least one minute of driving and a stop of about three minutes.",
             modifier = Modifier.padding(16.dp),
             color = SecondaryTextColor,
         )
@@ -1160,6 +1523,19 @@ private fun requiredPermissions(): Array<String> = buildList {
     add(Manifest.permission.ACCESS_COARSE_LOCATION)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
 }.toTypedArray()
+
+private fun Context.readThemeMode(): ThemeMode {
+    val name = getSharedPreferences(ThemePreferencesName, Context.MODE_PRIVATE)
+        .getString(ThemeModeKey, ThemeMode.System.name)
+    return ThemeMode.values().firstOrNull { it.name == name } ?: ThemeMode.System
+}
+
+private fun Context.writeThemeMode(mode: ThemeMode) {
+    getSharedPreferences(ThemePreferencesName, Context.MODE_PRIVATE)
+        .edit()
+        .putString(ThemeModeKey, mode.name)
+        .apply()
+}
 
 private fun Context.hasRequiredPermissions(permissions: Array<String>): Boolean {
     return permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }

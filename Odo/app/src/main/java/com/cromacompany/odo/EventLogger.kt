@@ -45,8 +45,8 @@ class EventLogger private constructor(private val context: Context) {
         )
         return Intent(Intent.ACTION_SEND)
             .setType("text/plain")
-            .putExtra(Intent.EXTRA_SUBJECT, "Odo eventi ed errori")
-            .putExtra(Intent.EXTRA_TEXT, "Log eventi ed errori Odo")
+            .putExtra(Intent.EXTRA_SUBJECT, "Odo events and errors")
+            .putExtra(Intent.EXTRA_TEXT, "Odo events and errors log")
             .putExtra(Intent.EXTRA_STREAM, uri)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
@@ -55,15 +55,15 @@ class EventLogger private constructor(private val context: Context) {
         ensureFileExists()
         val bytes = logFile.length()
         return when {
-            bytes >= 1_048_576 -> String.format(Locale.ITALIAN, "%.1f MB", bytes / 1_048_576f)
-            bytes >= 1_024 -> String.format(Locale.ITALIAN, "%.1f KB", bytes / 1_024f)
+            bytes >= 1_048_576 -> String.format(Locale.ENGLISH, "%.1f MB", bytes / 1_048_576f)
+            bytes >= 1_024 -> String.format(Locale.ENGLISH, "%.1f KB", bytes / 1_024f)
             else -> "$bytes B"
         }
     }
 
     fun clear() {
         logFile.writeText("", Charsets.UTF_8)
-        event("Log cancellato")
+        event("Log cleared")
     }
 
     private fun append(level: String, message: String, details: Map<String, Any?>) {
@@ -88,7 +88,7 @@ class EventLogger private constructor(private val context: Context) {
 
     private fun ensureFileExists() {
         if (!logFile.exists()) {
-            logFile.writeText("${timestamp()} [EVENT] Log creato\n", Charsets.UTF_8)
+            logFile.writeText("${timestamp()} [EVENT] Log created\n", Charsets.UTF_8)
         }
     }
 
@@ -102,7 +102,7 @@ class EventLogger private constructor(private val context: Context) {
 
     companion object {
         private const val LOG_FILE_NAME = "odo-events.txt"
-        private val FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS z", Locale.ITALIAN)
+        private val FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS z", Locale.ENGLISH)
 
         @Volatile
         private var instance: EventLogger? = null

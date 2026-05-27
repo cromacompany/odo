@@ -30,13 +30,13 @@ data class Trip(
 }
 
 enum class TrafficCondition(val label: String) {
-    Scorrevole("Traffico scorrevole"),
-    Moderato("Traffico moderato"),
-    Intenso("Traffico intenso"),
+    Scorrevole("Light traffic"),
+    Moderato("Moderate traffic"),
+    Intenso("Heavy traffic"),
 }
 
 fun formatDateTime(millis: Long): String {
-    val formatter = DateTimeFormatter.ofPattern("dd MMM yyyy, HH:mm", Locale.ITALIAN)
+    val formatter = DateTimeFormatter.ofPattern("dd MMM yyyy, HH:mm", Locale.ENGLISH)
     return Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(formatter)
 }
 
@@ -49,9 +49,9 @@ fun formatDuration(millis: Long): String {
 
 fun formatDistance(meters: Float): String {
     return if (meters >= 1_000f) {
-        String.format(Locale.ITALIAN, "%.1f km", meters / 1_000f)
+        String.format(Locale.ENGLISH, "%.1f km", meters / 1_000f)
     } else {
-        String.format(Locale.ITALIAN, "%.0f m", meters)
+        String.format(Locale.ENGLISH, "%.0f m", meters)
     }
 }
 
