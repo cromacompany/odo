@@ -12,14 +12,18 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.Granularity
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import java.util.concurrent.TimeUnit
 import java.util.UUID
 
 class TrackingService : Service() {
@@ -27,8 +31,10 @@ class TrackingService : Service() {
     private lateinit var repository: TripRepository
     private lateinit var logger: EventLogger
     private lateinit var trackingStateStore: TrackingStateStore
+    private var wakeLock: PowerManager.WakeLock? = null
     private var currentTripStartMillis: Long = 0L
     private val currentPoints = mutableListOf<RoutePoint>()
+    private var lastAcceptedLocation: AcceptedLocation? = null
     private var movingSinceMillis: Long? = null
     private var stoppedSinceMillis: Long? = null
     private var isRecording = false
@@ -43,6 +49,7 @@ class TrackingService : Service() {
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             trackingStateStore.recordHeartbeat()
+            acquireWakeLock()
             heartbeatHandler.postDelayed(this, HEARTBEAT_INTERVAL_MILLIS)
         }
     }
@@ -64,6 +71,7 @@ class TrackingService : Service() {
         fusedLocationProviderClient = LocationServices.getFusedLocationProviderClient(this)
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Automatic monitoring active"))
+        acquireWakeLock()
         startHeartbeat()
         startLocationUpdates()
     }
@@ -89,12 +97,36 @@ class TrackingService : Service() {
         heartbeatHandler.removeCallbacks(stopConfirmationRunnable)
         trackingStateStore.setMonitoring(false)
         fusedLocationProviderClient.removeLocationUpdates(locationCallback)
+        releaseWakeLock()
         super.onDestroy()
     }
 
     private fun startHeartbeat() {
         heartbeatHandler.removeCallbacks(heartbeatRunnable)
         heartbeatRunnable.run()
+    }
+
+    private fun acquireWakeLock() {
+        val existingWakeLock = wakeLock
+        if (existingWakeLock?.isHeld == true) {
+            existingWakeLock.acquire(WAKE_LOCK_TIMEOUT_MILLIS)
+            return
+        }
+        wakeLock = getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:TrackingService")
+            .apply {
+                setReferenceCounted(false)
+                acquire(WAKE_LOCK_TIMEOUT_MILLIS)
+            }
+        logger.event("Tracking wake lock acquired")
+    }
+
+    private fun releaseWakeLock() {
+        val heldWakeLock = wakeLock?.takeIf { it.isHeld } ?: return
+        runCatching { heldWakeLock.release() }
+            .onSuccess { logger.event("Tracking wake lock released") }
+            .onFailure { throwable -> logger.error("Tracking wake lock release error", throwable) }
+        wakeLock = null
     }
 
     private fun startLocationUpdates() {
@@ -107,6 +139,9 @@ class TrackingService : Service() {
         val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, LOCATION_INTERVAL_MILLIS)
             .setMinUpdateIntervalMillis(FASTEST_LOCATION_INTERVAL_MILLIS)
             .setMinUpdateDistanceMeters(MIN_DISTANCE_METERS)
+            .setGranularity(Granularity.GRANULARITY_FINE)
+            .setWaitForAccurateLocation(true)
+            .setMaxUpdateDelayMillis(LOCATION_INTERVAL_MILLIS)
             .build()
         runCatching {
             fusedLocationProviderClient.requestLocationUpdates(request, locationCallback, mainLooper)
@@ -137,28 +172,45 @@ class TrackingService : Service() {
     }
 
     private fun handleLocation(location: Location) {
-        if (location.accuracy > MAX_ACCURACY_METERS) {
+        val now = location.time.takeIf { it > 0L } ?: System.currentTimeMillis()
+        if (!isUsableLocation(location)) {
             logger.event(
-                "Location ignored due to low accuracy",
-                mapOf("accuracyMeters" to location.accuracy, "maxAccuracyMeters" to MAX_ACCURACY_METERS),
+                "Location ignored due to poor quality",
+                mapOf(
+                    "accuracyMeters" to if (location.hasAccuracy()) location.accuracy else null,
+                    "ageMillis" to locationAgeMillis(location),
+                    "maxAccuracyMeters" to MAX_ACCURACY_METERS,
+                    "maxAgeMillis" to MAX_LOCATION_AGE_MILLIS,
+                ),
             )
             return
         }
 
-        val now = location.time.takeIf { it > 0L } ?: System.currentTimeMillis()
-        val speedMetersPerSecond = when {
-            location.hasSpeed() -> location.speed
-            currentPoints.isNotEmpty() -> {
-                val previous = currentPoints.last()
-                val seconds = ((now - previous.timestampMillis) / 1_000f).coerceAtLeast(1f)
-                Location("").apply {
-                    latitude = previous.latitude
-                    longitude = previous.longitude
-                }.distanceTo(location) / seconds
-            }
-            else -> 0f
+        val previousAcceptedLocation = lastAcceptedLocation
+        val candidatePoint = RoutePoint(
+            latitude = location.latitude,
+            longitude = location.longitude,
+            timestampMillis = now,
+            speedMetersPerSecond = 0f,
+        )
+        if (previousAcceptedLocation != null && !isPlausibleTransition(previousAcceptedLocation, candidatePoint, location.accuracy)) {
+            logger.event(
+                "Location ignored due to impossible jump",
+                mapOf(
+                    "distanceMeters" to distanceBetween(previousAcceptedLocation.point, candidatePoint),
+                    "elapsedMillis" to (now - previousAcceptedLocation.point.timestampMillis),
+                    "accuracyMeters" to location.accuracy,
+                ),
+            )
+            return
         }
+
+        handleRouteGapIfNeeded(candidatePoint)
+
+        val speedMetersPerSecond = speedFor(location, now, previousAcceptedLocation)
         val isDrivingSpeed = speedMetersPerSecond >= START_SPEED_METERS_PER_SECOND
+        val acceptedPoint = candidatePoint.copy(speedMetersPerSecond = speedMetersPerSecond)
+        lastAcceptedLocation = AcceptedLocation(acceptedPoint, location.accuracy)
 
         if (!isRecording) {
             if (isDrivingSpeed) {
@@ -172,14 +224,8 @@ class TrackingService : Service() {
         }
 
         if (isRecording) {
-            val point = RoutePoint(
-                latitude = location.latitude,
-                longitude = location.longitude,
-                timestampMillis = now,
-                speedMetersPerSecond = speedMetersPerSecond,
-            )
-            if (currentPoints.isEmpty() || distanceFromLast(currentPoints, point) >= MIN_POINT_DISTANCE_METERS) {
-                currentPoints.add(point)
+            if (currentPoints.isEmpty() || distanceFromLast(currentPoints, acceptedPoint) >= MIN_POINT_DISTANCE_METERS) {
+                currentPoints.add(acceptedPoint)
             }
 
             if (speedMetersPerSecond <= STOP_SPEED_METERS_PER_SECOND) {
@@ -198,6 +244,60 @@ class TrackingService : Service() {
             }
 
             updateNotification()
+        }
+    }
+
+    private fun isUsableLocation(location: Location): Boolean {
+        if (location.latitude !in -90.0..90.0 || location.longitude !in -180.0..180.0) return false
+        if (!location.hasAccuracy() || location.accuracy <= 0f || location.accuracy > MAX_ACCURACY_METERS) return false
+        val ageMillis = locationAgeMillis(location)
+        if (ageMillis != null && ageMillis > MAX_LOCATION_AGE_MILLIS) return false
+        return true
+    }
+
+    private fun locationAgeMillis(location: Location): Long? {
+        val elapsedRealtimeNanos = location.elapsedRealtimeNanos.takeIf { it > 0L } ?: return null
+        return SystemClock.elapsedRealtime() - TimeUnit.NANOSECONDS.toMillis(elapsedRealtimeNanos)
+    }
+
+    private fun speedFor(location: Location, now: Long, previousAcceptedLocation: AcceptedLocation?): Float {
+        val hasReliableSpeed = location.hasSpeed() &&
+            location.speed in 0f..MAX_REASONABLE_SPEED_METERS_PER_SECOND &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                !location.hasSpeedAccuracy() ||
+                location.speedAccuracyMetersPerSecond <= MAX_SPEED_ACCURACY_METERS_PER_SECOND)
+        if (hasReliableSpeed) {
+            return location.speed
+        }
+        val previous = previousAcceptedLocation?.point ?: return 0f
+        val elapsedSeconds = ((now - previous.timestampMillis) / 1_000f).takeIf { it > 0f } ?: return 0f
+        return (distanceBetween(previous, RoutePoint(location.latitude, location.longitude, now, 0f)) / elapsedSeconds)
+            .coerceIn(0f, MAX_REASONABLE_SPEED_METERS_PER_SECOND)
+    }
+
+    private fun isPlausibleTransition(previous: AcceptedLocation, point: RoutePoint, accuracyMeters: Float): Boolean {
+        val elapsedSeconds = ((point.timestampMillis - previous.point.timestampMillis) / 1_000f).takeIf { it > 0f }
+            ?: return false
+        val distanceMeters = distanceBetween(previous.point, point)
+        val allowedDistance = MAX_REASONABLE_SPEED_METERS_PER_SECOND * elapsedSeconds +
+            previous.accuracyMeters +
+            accuracyMeters +
+            GPS_NOISE_ALLOWANCE_METERS
+        return distanceMeters <= allowedDistance
+    }
+
+    private fun handleRouteGapIfNeeded(point: RoutePoint) {
+        if (!isRecording || currentPoints.isEmpty()) return
+        val previous = currentPoints.last()
+        val elapsedMillis = point.timestampMillis - previous.timestampMillis
+        val distanceMeters = distanceBetween(previous, point)
+        if (elapsedMillis > MAX_ROUTE_GAP_MILLIS && distanceMeters > MAX_CONTINUOUS_ROUTE_GAP_DISTANCE_METERS) {
+            logger.event(
+                "Route split due to long GPS gap",
+                mapOf("elapsedMillis" to elapsedMillis, "distanceMeters" to distanceMeters),
+            )
+            finishTripIfNeeded(previous.timestampMillis)
+            movingSinceMillis = point.timestampMillis - START_CONFIRMATION_MILLIS
         }
     }
 
@@ -313,6 +413,7 @@ class TrackingService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val LOCATION_INTERVAL_MILLIS = 5_000L
         private const val HEARTBEAT_INTERVAL_MILLIS = 15_000L
+        private const val WAKE_LOCK_TIMEOUT_MILLIS = 10 * 60_000L
         private const val FASTEST_LOCATION_INTERVAL_MILLIS = 2_000L
         private const val START_CONFIRMATION_MILLIS = 20_000L
         private const val STOP_CONFIRMATION_MILLIS = 180_000L
@@ -320,8 +421,19 @@ class TrackingService : Service() {
         private const val MIN_DISTANCE_METERS = 10f
         private const val MIN_POINT_DISTANCE_METERS = 15f
         private const val MAX_ACCURACY_METERS = 50f
+        private const val MAX_LOCATION_AGE_MILLIS = 45_000L
+        private const val MAX_REASONABLE_SPEED_METERS_PER_SECOND = 60f
+        private const val MAX_SPEED_ACCURACY_METERS_PER_SECOND = 8f
+        private const val GPS_NOISE_ALLOWANCE_METERS = 80f
+        private const val MAX_ROUTE_GAP_MILLIS = 60_000L
+        private const val MAX_CONTINUOUS_ROUTE_GAP_DISTANCE_METERS = 700f
         private const val START_SPEED_METERS_PER_SECOND = 8.3f
         private const val STOP_SPEED_METERS_PER_SECOND = 1.4f
         private const val MIN_TRIP_POINTS = 3
     }
+
+    private data class AcceptedLocation(
+        val point: RoutePoint,
+        val accuracyMeters: Float,
+    )
 }

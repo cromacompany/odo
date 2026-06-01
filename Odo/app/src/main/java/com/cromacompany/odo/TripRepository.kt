@@ -18,6 +18,12 @@ class TripRepository(context: Context) {
         preferences.edit().putString(KEY_TRIPS, updated.tripsToJson().toString()).apply()
     }
 
+    fun deleteTrip(tripId: String) {
+        val updated = _trips.value.filterNot { it.id == tripId }
+        _trips.value = updated
+        preferences.edit().putString(KEY_TRIPS, updated.tripsToJson().toString()).apply()
+    }
+
     fun replaceTrips(trips: List<Trip>) {
         _trips.value = trips
         preferences.edit().putString(KEY_TRIPS, trips.tripsToJson().toString()).apply()

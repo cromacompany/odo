@@ -11,8 +11,11 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.location.Geocoder
 import android.location.Location
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.MotionEvent
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -46,13 +49,21 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DatePickerDialog
+import androidx.compose.material3.DateRangePicker
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDateRangePickerState
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
@@ -83,6 +94,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.cromacompany.odo.ui.theme.OdoTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -95,8 +107,10 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 import java.time.Instant
+import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
 import android.graphics.Color as AndroidColor
@@ -106,6 +120,7 @@ private enum class ThemeMode(val label: String) {
     Light("Light"),
     Dark("Dark"),
 }
+
 
 private const val ThemePreferencesName = "odo_theme_preferences"
 private const val ThemeModeKey = "theme_mode"
@@ -202,6 +217,7 @@ private fun OdoApp(
         hasPermissions = results.values.all { it }
         logger.event("Permission request result", results)
         if (hasPermissions) {
+            context.requestBatteryOptimizationExemption(logger)
             context.startTrackingService()
             trackingStateStore.setMonitoring(true)
         } else {
@@ -226,6 +242,7 @@ private fun OdoApp(
         if (context.hasRequiredPermissions(permissions)) {
             hasPermissions = true
             logger.event("Monitoring start requested from UI")
+            context.requestBatteryOptimizationExemption(logger)
             context.startTrackingService()
             trackingStateStore.setMonitoring(true)
         } else {
@@ -309,12 +326,18 @@ private fun OdoApp(
 
         if (isHistoryOpen) {
             TripHistoryScreen(
-                trips = trips.drop(3),
+                trips = trips,
                 modifier = Modifier.padding(innerPadding),
                 onBack = { isHistoryOpen = false },
                 onOpenTrip = { trip ->
                     selectedTripId = trip.id
                     detailTripId = trip.id
+                },
+                onDeleteTrip = { trip ->
+                    repository.deleteTrip(trip.id)
+                    if (selectedTripId == trip.id) selectedTripId = null
+                    if (detailTripId == trip.id) detailTripId = null
+                    if (mapTripId == trip.id) mapTripId = null
                 },
             )
             return@Scaffold
@@ -350,7 +373,7 @@ private fun OdoApp(
 
             item {
                 HistorySectionHeader(
-                    showArchive = trips.size > 3,
+                    showArchive = trips.isNotEmpty(),
                     onOpenArchive = { isHistoryOpen = true },
                 )
             }
@@ -367,6 +390,12 @@ private fun OdoApp(
                         onClick = {
                             selectedTripId = trip.id
                             detailTripId = trip.id
+                        },
+                        onDelete = {
+                            repository.deleteTrip(trip.id)
+                            if (selectedTripId == trip.id) selectedTripId = null
+                            if (detailTripId == trip.id) detailTripId = null
+                            if (mapTripId == trip.id) mapTripId = null
                         },
                     )
                 }
@@ -402,8 +431,17 @@ private fun TripHistoryScreen(
     modifier: Modifier = Modifier,
     onBack: () -> Unit,
     onOpenTrip: (Trip) -> Unit,
+    onDeleteTrip: (Trip) -> Unit,
 ) {
-    val tripsByDate = remember(trips) { trips.groupBy { formatDate(it.startMillis) } }
+    val context = LocalContext.current
+    val logger = remember { EventLogger.get(context) }
+    var filterStartMillis by rememberSaveable { mutableStateOf<Long?>(null) }
+    var filterEndMillis by rememberSaveable { mutableStateOf<Long?>(null) }
+    var showFilterDialog by rememberSaveable { mutableStateOf(false) }
+    val filteredTrips = remember(trips, filterStartMillis, filterEndMillis) {
+        if (filterStartMillis == null || filterEndMillis == null) trips else trips.filterByDateRange(filterStartMillis ?: 0L, filterEndMillis ?: 0L)
+    }
+    val tripsByDate = remember(filteredTrips) { filteredTrips.groupBy { formatDate(it.startMillis) } }
 
     LazyColumn(
         modifier = modifier
@@ -423,7 +461,7 @@ private fun TripHistoryScreen(
                         color = TitleColor,
                     )
                     Text(
-                        text = "${trips.size} previous trips",
+                        text = "${filteredTrips.size} of ${trips.size} trips",
                         style = MaterialTheme.typography.bodyMedium,
                         color = SecondaryTextColor,
                     )
@@ -434,7 +472,18 @@ private fun TripHistoryScreen(
             }
         }
 
-        if (trips.isEmpty()) {
+        item {
+            ArchiveFilterBar(
+                filterStartMillis = filterStartMillis,
+                filterEndMillis = filterEndMillis,
+                trips = trips,
+                canExport = filteredTrips.isNotEmpty(),
+                onOpenFilter = { showFilterDialog = true },
+                onExport = { context.shareTripsCsv(filteredTrips, filterStartMillis, filterEndMillis, logger) },
+            )
+        }
+
+        if (filteredTrips.isEmpty()) {
             item {
                 EmptyHistory()
             }
@@ -453,10 +502,113 @@ private fun TripHistoryScreen(
                         trip = trip,
                         isSelected = false,
                         onClick = { onOpenTrip(trip) },
+                        onDelete = { onDeleteTrip(trip) },
                     )
                 }
             }
         }
+    }
+
+    if (showFilterDialog) {
+        TripArchiveFilterDialog(
+            initialStartMillis = filterStartMillis ?: trips.minOfOrNull { it.startMillis } ?: currentMonthStartMillis(),
+            initialEndMillis = filterEndMillis ?: trips.maxOfOrNull { it.startMillis } ?: currentMonthEndMillis(),
+            onDismiss = { showFilterDialog = false },
+            onApply = { startMillis, endMillis ->
+                filterStartMillis = startMillis
+                filterEndMillis = endMillis
+                showFilterDialog = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun ArchiveFilterBar(
+    filterStartMillis: Long?,
+    filterEndMillis: Long?,
+    trips: List<Trip>,
+    canExport: Boolean,
+    onOpenFilter: () -> Unit,
+    onExport: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = AppSurfaceColor,
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = archiveDateRangeLabel(filterStartMillis, filterEndMillis, trips),
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = BodyColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                IconButton(onClick = onOpenFilter) {
+                    FilterIcon()
+                }
+                IconButton(enabled = canExport, onClick = onExport) {
+                    ExportIcon(enabled = canExport)
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TripArchiveFilterDialog(
+    initialStartMillis: Long,
+    initialEndMillis: Long,
+    onDismiss: () -> Unit,
+    onApply: (Long, Long) -> Unit,
+) {
+    val pickerState = rememberDateRangePickerState(
+        initialSelectedStartDateMillis = initialStartMillis,
+        initialSelectedEndDateMillis = initialEndMillis,
+    )
+    DatePickerDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(
+                enabled = pickerState.selectedStartDateMillis != null,
+                onClick = {
+                    val startMillis = pickerState.selectedStartDateMillis ?: return@TextButton
+                    val endMillis = pickerState.selectedEndDateMillis ?: startMillis
+                    onApply(startMillis, endMillis)
+                },
+            ) {
+                Text("Apply")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+    ) {
+        DateRangePicker(
+            state = pickerState,
+            title = {
+                Text(
+                    text = "Filter trips",
+                    modifier = Modifier.padding(start = 24.dp, end = 12.dp, top = 16.dp),
+                    style = MaterialTheme.typography.titleLarge,
+                )
+            },
+            headline = {
+                Text(
+                    text = "Select start and end",
+                    modifier = Modifier.padding(start = 24.dp, end = 12.dp, bottom = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = SecondaryTextColor,
+                )
+            },
+        )
     }
 }
 
@@ -592,6 +744,35 @@ private fun BackArrowIcon() {
         drawLine(color, Offset(7.dp.toPx(), y), Offset(20.dp.toPx(), y), stroke, cap = StrokeCap.Round)
         drawLine(color, Offset(7.dp.toPx(), y), Offset(13.dp.toPx(), 6.dp.toPx()), stroke, cap = StrokeCap.Round)
         drawLine(color, Offset(7.dp.toPx(), y), Offset(13.dp.toPx(), 18.dp.toPx()), stroke, cap = StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun FilterIcon() {
+    val color = TitleColor
+    Canvas(modifier = Modifier.size(24.dp)) {
+        val stroke = 2.2.dp.toPx()
+        val topY = 6.dp.toPx()
+        val middleY = 12.dp.toPx()
+        val bottomY = 18.dp.toPx()
+        drawLine(color, Offset(5.dp.toPx(), topY), Offset(19.dp.toPx(), topY), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(8.dp.toPx(), middleY), Offset(16.dp.toPx(), middleY), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(11.dp.toPx(), bottomY), Offset(13.dp.toPx(), bottomY), stroke, cap = StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun ExportIcon(enabled: Boolean) {
+    val color = if (enabled) TitleColor else SecondaryTextColor.copy(alpha = 0.45f)
+    Canvas(modifier = Modifier.size(24.dp)) {
+        val stroke = 2.2.dp.toPx()
+        val centerX = size.width / 2f
+        drawLine(color, Offset(centerX, 5.dp.toPx()), Offset(centerX, 15.dp.toPx()), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(centerX, 5.dp.toPx()), Offset(8.dp.toPx(), 9.dp.toPx()), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(centerX, 5.dp.toPx()), Offset(16.dp.toPx(), 9.dp.toPx()), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(6.dp.toPx(), 17.dp.toPx()), Offset(6.dp.toPx(), 20.dp.toPx()), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(6.dp.toPx(), 20.dp.toPx()), Offset(18.dp.toPx(), 20.dp.toPx()), stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(18.dp.toPx(), 20.dp.toPx()), Offset(18.dp.toPx(), 17.dp.toPx()), stroke, cap = StrokeCap.Round)
     }
 }
 
@@ -1356,6 +1537,44 @@ private fun formatDate(millis: Long): String {
     return Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(formatter)
 }
 
+private fun archiveDateRangeLabel(startMillis: Long?, endMillis: Long?, trips: List<Trip> = emptyList()): String {
+    if (startMillis == null || endMillis == null) {
+        if (trips.isEmpty()) return "All trips"
+        return dateRangeLabel(
+            startMillis = trips.minOf { it.startMillis },
+            endMillis = trips.maxOf { it.startMillis },
+        )
+    }
+    return dateRangeLabel(startMillis, endMillis)
+}
+
+private fun dateRangeLabel(startMillis: Long, endMillis: Long): String {
+    val zone = ZoneId.systemDefault()
+    val formatter = DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH)
+    val start = Instant.ofEpochMilli(startMillis).atZone(zone).toLocalDate().format(formatter)
+    val end = Instant.ofEpochMilli(endMillis).atZone(zone).toLocalDate().format(formatter)
+    return "$start - $end"
+}
+
+private fun currentMonthStartMillis(): Long {
+    val zone = ZoneId.systemDefault()
+    return YearMonth.now(zone).atDay(1).atStartOfDay(zone).toInstant().toEpochMilli()
+}
+
+private fun currentMonthEndMillis(): Long {
+    val zone = ZoneId.systemDefault()
+    return YearMonth.now(zone).atEndOfMonth().atStartOfDay(zone).toInstant().toEpochMilli()
+}
+
+private fun List<Trip>.filterByDateRange(startMillis: Long, endMillis: Long): List<Trip> {
+    val zone = ZoneId.systemDefault()
+    val startDate = Instant.ofEpochMilli(startMillis).atZone(zone).toLocalDate()
+    val endDate = Instant.ofEpochMilli(endMillis).atZone(zone).toLocalDate()
+    val rangeStartMillis = startDate.atStartOfDay(zone).toInstant().toEpochMilli()
+    val rangeEndMillis = endDate.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+    return filter { trip -> trip.startMillis >= rangeStartMillis && trip.startMillis < rangeEndMillis }
+}
+
 private fun RoutePoint.distanceTo(position: GeoPoint): Float {
     val results = FloatArray(1)
     Location.distanceBetween(latitude, longitude, position.latitude, position.longitude, results)
@@ -1436,36 +1655,92 @@ private fun RoutePoint.coordinateLabel(): String {
     return String.format(Locale.ENGLISH, "%.5f, %.5f", latitude, longitude)
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TripRow(trip: Trip, isSelected: Boolean, onClick: () -> Unit) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = if (isSelected) SelectedTripColor else AppSurfaceColor),
-    ) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            MiniRoute(points = trip.points)
-            Spacer(modifier = Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
+private fun TripRow(trip: Trip, isSelected: Boolean, onClick: () -> Unit, onDelete: () -> Unit) {
+    var showDeleteConfirmation by remember(trip.id) { mutableStateOf(false) }
+    val dismissState = rememberSwipeToDismissBoxState(
+        confirmValueChange = { value ->
+            if (value != SwipeToDismissBoxValue.Settled) {
+                showDeleteConfirmation = true
+            }
+            false
+        },
+        positionalThreshold = { distance -> distance * 0.35f },
+    )
+
+    if (showDeleteConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirmation = false },
+            title = { Text("Delete trip?") },
+            text = { Text("This trip will be removed from history.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteConfirmation = false
+                        onDelete()
+                    },
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirmation = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
+    SwipeToDismissBox(
+        state = dismissState,
+        backgroundContent = {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFFB42318))
+                    .padding(horizontal = 20.dp),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
                 Text(
-                    formatDateTime(trip.startMillis),
+                    text = "Delete",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.SemiBold,
-                    color = TitleColor,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
                 )
-                Text(
-                    "${formatDuration(trip.durationMillis)} • ${formatDistance(trip.distanceMeters)} • ${trip.trafficCondition.label}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = SecondaryTextColor,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+            }
+        },
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick),
+            shape = RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = if (isSelected) SelectedTripColor else AppSurfaceColor),
+        ) {
+            Row(
+                modifier = Modifier.padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                MiniRoute(points = trip.points)
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        formatDateTime(trip.startMillis),
+                        fontWeight = FontWeight.SemiBold,
+                        color = TitleColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${formatDuration(trip.durationMillis)} • ${formatDistance(trip.distanceMeters)} • ${trip.trafficCondition.label}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SecondaryTextColor,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }
@@ -1539,6 +1814,111 @@ private fun Context.writeThemeMode(mode: ThemeMode) {
 
 private fun Context.hasRequiredPermissions(permissions: Array<String>): Boolean {
     return permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
+}
+
+private fun Context.requestBatteryOptimizationExemption(logger: EventLogger) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+    val powerManager = getSystemService(PowerManager::class.java)
+    if (powerManager.isIgnoringBatteryOptimizations(packageName)) {
+        logger.event("Battery optimization exemption already granted")
+        return
+    }
+    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        .setData(Uri.parse("package:$packageName"))
+    runCatching {
+        if (intent.resolveActivity(packageManager) != null) {
+            logger.event("Battery optimization exemption requested")
+            startActivity(intent)
+        } else {
+            logger.error("Battery optimization exemption request unavailable")
+        }
+    }.onFailure { throwable ->
+        logger.error("Battery optimization exemption request error", throwable)
+    }
+}
+
+private fun Context.shareTripsCsv(
+    trips: List<Trip>,
+    filterStartMillis: Long?,
+    filterEndMillis: Long?,
+    logger: EventLogger,
+) {
+    if (trips.isEmpty()) return
+    runCatching {
+        val directory = File(filesDir, "exports")
+        if (!directory.exists()) directory.mkdirs()
+        val file = File(directory, "odo-trips-${trips.exportFileDateRange()}.csv")
+        file.writeText(trips.toCsv(), Charsets.UTF_8)
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val title = "Odo trips - ${archiveDateRangeLabel(filterStartMillis, filterEndMillis, trips)}"
+        val intent = Intent(Intent.ACTION_SEND)
+            .setType("text/csv")
+            .putExtra(Intent.EXTRA_SUBJECT, title)
+            .putExtra(Intent.EXTRA_TEXT, title)
+            .putExtra(Intent.EXTRA_STREAM, uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        logger.event("Trip CSV export requested", mapOf("trips" to trips.size, "range" to archiveDateRangeLabel(filterStartMillis, filterEndMillis, trips)))
+        startActivity(Intent.createChooser(intent, "Export trips CSV"))
+    }.onFailure { throwable ->
+        logger.error("Trip CSV export error", throwable)
+    }
+}
+
+private fun List<Trip>.toCsv(): String {
+    val trips = this
+    return buildString {
+        appendCsvRow(
+            listOf(
+                "id",
+                "start",
+                "end",
+                "duration_minutes",
+                "distance_meters",
+                "traffic",
+                "points",
+                "start_latitude",
+                "start_longitude",
+                "end_latitude",
+                "end_longitude",
+            ),
+        )
+        for (trip in trips) {
+            val startPoint = trip.points.firstOrNull()
+            val endPoint = trip.points.lastOrNull()
+            appendCsvRow(
+                listOf(
+                    trip.id,
+                    isoDateTime(trip.startMillis),
+                    isoDateTime(trip.endMillis),
+                    String.format(Locale.ENGLISH, "%.1f", trip.durationMillis / 60_000f),
+                    String.format(Locale.ENGLISH, "%.1f", trip.distanceMeters),
+                    trip.trafficCondition.label,
+                    trip.points.size.toString(),
+                    startPoint?.latitude?.let { String.format(Locale.ENGLISH, "%.6f", it) }.orEmpty(),
+                    startPoint?.longitude?.let { String.format(Locale.ENGLISH, "%.6f", it) }.orEmpty(),
+                    endPoint?.latitude?.let { String.format(Locale.ENGLISH, "%.6f", it) }.orEmpty(),
+                    endPoint?.longitude?.let { String.format(Locale.ENGLISH, "%.6f", it) }.orEmpty(),
+                ),
+            )
+        }
+    }
+}
+
+private fun List<Trip>.exportFileDateRange(): String {
+    val zone = ZoneId.systemDefault()
+    val formatter = DateTimeFormatter.ofPattern("yyyyMMdd", Locale.ENGLISH)
+    val firstDate = minOf { it.startMillis }.let { Instant.ofEpochMilli(it).atZone(zone).format(formatter) }
+    val lastDate = maxOf { it.startMillis }.let { Instant.ofEpochMilli(it).atZone(zone).format(formatter) }
+    return "$firstDate-$lastDate"
+}
+
+private fun StringBuilder.appendCsvRow(values: List<String>) {
+    append(values.joinToString(",") { value -> "\"${value.replace("\"", "\"\"")}\"" })
+    append('\n')
+}
+
+private fun isoDateTime(millis: Long): String {
+    return DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()))
 }
 
 private fun Context.startTrackingService() {
